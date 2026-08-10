@@ -1,0 +1,19 @@
+{
+  "name": "mexc-flow-trading-bot",
+  "version": "1.0.0",
+  "description": "Binance aggressive-flow signal detector merged with MEXC Futures auto-execution",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "DRY_RUN=true node index.js",
+    "check-balance": "node scripts/check-balance.js",
+    "check-positions": "node scripts/check-positions.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "ws": "^8.18.0"
+  }
+}
