@@ -3,10 +3,17 @@ const { floorToStep, roundToTick, isValidNumber } = require('../utils/helpers');
 const logger = require('../utils/logger');
 
 /**
- * Рахує лише ціни TP/SL (тригер + ціна виконання лімітного ордера) для заданої
- * ціни входу. Винесено окремо, бо після ринкового ордера треба перерахувати
- * ці ціни під ФАКТИЧНУ (dealAvgPrice) ціну заповнення, а не під ту, що була
- * на момент розрахунку розміру позиції кілька сотень мс тому.
+ * Рахує ціни TP/SL для заданої ціни входу. Винесено окремо, бо після
+ * ринкового ордера треба перерахувати ці ціни під ФАКТИЧНУ (dealAvgPrice)
+ * ціну заповнення, а не під ту, що була на момент розрахунку розміру
+ * позиції кілька сотень мс тому.
+ *
+ * ПРИМІТКА: stopLossPrice/takeProfitPrice — це і є ЄДИНІ ціни, які реально
+ * йдуть на MEXC (stoporder/place приймає лише одну ціну на сторону, див.
+ * коментар у mexc.service.js::placeTpSl). stopLossOrderPrice/
+ * takeProfitOrderPrice (з невеликим буфером) MEXC більше не отримує —
+ * вони лишились лише для симуляції DRY_RUN (checkDryRunPosition
+ * використовує їх як приблизну ціну заповнення після "спрацювання").
  */
 function computeExitPrices(entryPrice, direction, contractInfo) {
   const { takeProfitPercent, stopLossPercent, slFillBufferPercent, tpFillBufferPercent } = config.risk;
@@ -123,8 +130,7 @@ function calculatePositionParameters(balance, entryPrice, direction, contractInf
 
   logger.info(
     `[RISK] ${direction} | contracts=${contracts} | entry≈${roundedEntryPrice} | ` +
-    `TP(trigger)=${exitPrices.takeProfitPrice} TP(limit)=${exitPrices.takeProfitOrderPrice} | ` +
-    `SL(trigger)=${exitPrices.stopLossPrice} SL(limit)=${exitPrices.stopLossOrderPrice} | ` +
+    `TP=${exitPrices.takeProfitPrice} | SL=${exitPrices.stopLossPrice} | ` +
     `margin=${finalRequiredMargin.toFixed(2)} USDT | risk=${riskAmount.toFixed(2)} USDT`
   );
 

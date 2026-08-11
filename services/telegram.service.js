@@ -46,8 +46,8 @@ class TelegramService {
 <b>Плече:</b> ${p.leverage}x
 <b>Маржа:</b> $${p.requiredMargin.toFixed(2)}
 
-🎯 <b>TP (тригер / ліміт):</b> $${p.takeProfitPrice} / $${p.takeProfitOrderPrice}
-🛑 <b>SL (тригер / ліміт):</b> $${p.stopLossPrice} / $${p.stopLossOrderPrice}
+🎯 <b>TP:</b> $${p.takeProfitPrice}
+🛑 <b>SL:</b> $${p.stopLossPrice}
 💰 <b>Ризик:</b> $${p.riskAmount.toFixed(2)}`;
   }
 

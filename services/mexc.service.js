@@ -171,28 +171,28 @@ class MexcService {
   }
 
   /**
-   * Ставить TP і SL прив'язані до позиції ОДНИМ запитом (OCO-подібна поведінка:
-   * коли один тригериться, інший знімається). ВАЖЛИВО: takeProfitType=1 і
-   * stopLossType=1 означають, що після спрацювання тригера на біржу йде
-   * ЛІМІТНИЙ ордер (а не ринковий) — саме так, як ти просив.
+   * Ставить TP і SL, прив'язані до позиції, ОДНИМ запитом (OCO-подібна
+   * поведінка: коли одне тригериться, інше знімається).
+   *
+   * ВАЖЛИВО (знайдено на реальному ордері 2026-08-11): MEXC відхиляє запит
+   * помилкою [600] "takeProfitPrice and takeProfitOrderPrice cannot be set
+   * at the same time", якщо для однієї сторони передати ОБИДВІ ціни —
+   * окрему тригер-ціну і окрему ціну ліміт-виконання. Дозволена лише ОДНА
+   * ціна на сторону. При stopLossType=1/takeProfitType=1 (limit) саме ця
+   * єдина ціна є одночасно і тригером, і ціною ліміт-ордера, який MEXC
+   * виставить, коли тригер спрацює.
    */
-  async placeTpSl({
-    positionId, vol,
-    stopLossPrice, stopLossOrderPrice,
-    takeProfitPrice, takeProfitOrderPrice
-  }) {
+  async placeTpSl({ positionId, vol, stopLossPrice, takeProfitPrice }) {
     const params = {
       positionId,
       vol,
-      lossTrend: 1,      // 1 = latest price як джерело тригера
+      lossTrend: 1,        // 1 = latest price як джерело тригера
       profitTrend: 1,
       stopLossPrice,
+      stopLossType: 1,     // 0 market SL / 1 limit SL
       takeProfitPrice,
-      stopLossType: 1,       // 0 market SL / 1 limit SL
-      stopLossOrderPrice,
-      takeProfitType: 1,     // 0 market TP / 1 limit TP
-      takeProfitOrderPrice,
-      volType: 2         // 2 = TP/SL по всій позиції
+      takeProfitType: 1,   // 0 market TP / 1 limit TP
+      volType: 2           // 2 = TP/SL по всій позиції
     };
     const res = await this.request('POST', '/api/v1/private/stoporder/place', params, true);
     return res.data;
@@ -201,6 +201,25 @@ class MexcService {
   async cancelOrders(orderIds) {
     if (!orderIds || !orderIds.length) return null;
     const res = await this.request('POST', '/api/v1/private/order/cancel', { orderIds }, true);
+    return res.data;
+  }
+
+  /**
+   * Аварійне закриття позиції по ринку. side: 2 = close short, 4 = close long.
+   * Використовується як страховка, якщо не вдалось поставити TP/SL —
+   * краще гарантовано закрити зараз, ніж лишити позицію без захисту.
+   */
+  async closePositionMarket({ symbol, direction, vol, price }) {
+    const side = direction === 'LONG' ? 4 : 2;
+    const params = {
+      symbol,
+      price,
+      vol,
+      side,
+      type: 5, // market
+      openType: config.trading.openType
+    };
+    const res = await this.request('POST', '/api/v1/private/order/create', params, true);
     return res.data;
   }
 
