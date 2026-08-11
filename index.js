@@ -102,6 +102,52 @@ function handleSignal(symbol, stats, interpretation) {
 }
 
 // ----------------------------------------------------------------------------
+// ЗАХИСТ ПОЗИЦІЇ (TP/SL) З ПОВТОРНИМИ СПРОБАМИ + АВАРІЙНЕ ЗАКРИТТЯ
+// Позиція на цей момент вже РЕАЛЬНО відкрита на біржі. Якщо TP/SL не вдасться
+// поставити жодного разу — краще гарантовано закрити позицію по ринку зараз
+// (відомий, обмежений результат), ніж лишити її висіти без жодного захисту
+// з плечем 20x на невизначений час.
+// ----------------------------------------------------------------------------
+async function attachProtectionWithRetry(positionId, vol, exitPrices, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await mexc.placeTpSl({
+        positionId,
+        vol,
+        stopLossPrice: exitPrices.stopLossPrice,
+        takeProfitPrice: exitPrices.takeProfitPrice
+      });
+      logger.info(`[TRADE] TP/SL встановлено (спроба ${i + 1}/${attempts})`);
+      return true;
+    } catch (error) {
+      logger.error(`[TRADE] Спроба ${i + 1}/${attempts} поставити TP/SL невдала: ${error.message}`);
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return false;
+}
+
+async function emergencyClosePosition({ mexcSymbol, direction, vol, entryPrice }) {
+  logger.error(`[TRADE] ⚠️ КРИТИЧНО: TP/SL не встановлено для ${mexcSymbol} після кількох спроб — аварійно закриваю позицію по ринку`);
+  try {
+    await mexc.closePositionMarket({ symbol: mexcSymbol, direction, vol, price: entryPrice });
+    await telegram.send(
+      `🚨 <b>АВАРІЙНЕ ЗАКРИТТЯ ПОЗИЦІЇ</b>\n\n` +
+      `<b>${mexcSymbol} ${direction}</b>: не вдалось поставити TP/SL після кількох спроб — ` +
+      `позицію закрито по ринку для безпеки, щоб не лишати її без захисту.\n\n` +
+      `Перевір вручну в MEXC, що позиція дійсно закрита, і подивись логи — можливо, TP/SL стабільно падає з тією ж помилкою.`
+    );
+  } catch (closeError) {
+    logger.error(`[TRADE] КРИТИЧНО: не вдалось навіть аварійно закрити позицію: ${closeError.message}`);
+    await telegram.send(
+      `🚨🚨 <b>КРИТИЧНА ПОМИЛКА — ПОЗИЦІЯ БЕЗ ЗАХИСТУ</b>\n\n` +
+      `<b>${mexcSymbol} ${direction}</b>: TP/SL не встановлено, аварійне закриття ТЕЖ не вдалось ` +
+      `(${closeError.message}).\n\n⚠️ ЗАЙДИ В MEXC ВРУЧНУ НЕГАЙНО І ЗАКРИЙ/ЗАХИСТИ ПОЗИЦІЮ!`
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
 // Виконання угоди на MEXC на початку хвилини
 // ----------------------------------------------------------------------------
 async function executeTrade(symbol, direction, cfg) {
@@ -187,14 +233,16 @@ async function executeTrade(symbol, direction, cfg) {
 
   const exitPrices = riskService.computeExitPrices(actualEntryPrice, direction, contractInfo);
 
-  await mexc.placeTpSl({
-    positionId,
-    vol: actualVol,
-    stopLossPrice: exitPrices.stopLossPrice,
-    stopLossOrderPrice: exitPrices.stopLossOrderPrice,
-    takeProfitPrice: exitPrices.takeProfitPrice,
-    takeProfitOrderPrice: exitPrices.takeProfitOrderPrice
-  });
+  // Позиція вже РЕАЛЬНО відкрита на біржі до цього моменту. Якщо TP/SL не
+  // вдасться поставити — це небезпечна ситуація (позиція без захисту),
+  // тому пробуємо кілька разів, а якщо все одно не вийшло — аварійно
+  // закриваємо позицію по ринку, замість того щоб лишити її голою.
+  const protectionOk = await attachProtectionWithRetry(positionId, actualVol, exitPrices);
+
+  if (!protectionOk) {
+    await emergencyClosePosition({ mexcSymbol, direction, vol: actualVol, entryPrice: actualEntryPrice });
+    return;
+  }
 
   const openedPosition = {
     symbol,
