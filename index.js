@@ -21,7 +21,7 @@ const MultiWebSocketManager = require('./core/websocket-manager');
 
 // Версійна мітка — щоб при діагностиці одразу бачити в логах, яка саме
 // версія коду реально запущена (а не гадати після кожного фіксу).
-const BOT_BUILD = '2026-08-14-startup-test-trade';
+const BOT_BUILD = '2026-08-14-atomic-tpsl';
 
 // ----------------------------------------------------------------------------
 // Денна статистика / ліміти
@@ -106,31 +106,27 @@ function handleSignal(symbol, stats, interpretation) {
 }
 
 // ----------------------------------------------------------------------------
-// ЗАХИСТ ПОЗИЦІЇ (TP/SL) З ПОВТОРНИМИ СПРОБАМИ + АВАРІЙНЕ ЗАКРИТТЯ
-// Позиція на цей момент вже РЕАЛЬНО відкрита на біржі. Якщо TP/SL не вдасться
-// поставити жодного разу — краще гарантовано закрити позицію по ринку зараз
-// (відомий, обмежений результат), ніж лишити її висіти без жодного захисту
-// з плечем 20x на невизначений час.
+// ЗАХИСТ ПОЗИЦІЇ (TP/SL)
+// ⚠️ Раніше тут була функція attachProtectionWithRetry() — окремий виклик
+// stoporder/place ПІСЛЯ відкриття позиції, з 3 спробами. Прибрано: TP/SL
+// тепер кріпиться АТОМАРНО одним запитом разом із входом (див.
+// mexc.openMarketOrderWithProtection у executeTrade нижче) — окремий крок
+// і, відповідно, retry-логіка для нього більше не потрібні.
 // ----------------------------------------------------------------------------
-async function attachProtectionWithRetry(positionId, vol, exitPrices, attempts = 3) {
-  for (let i = 0; i < attempts; i++) {
-    try {
-      await mexc.placeTpSl({
-        positionId,
-        vol,
-        stopLossPrice: exitPrices.stopLossPrice,
-        takeProfitPrice: exitPrices.takeProfitPrice
-      });
-      logger.info(`[TRADE] TP/SL встановлено (спроба ${i + 1}/${attempts})`);
-      return true;
-    } catch (error) {
-      logger.error(`[TRADE] Спроба ${i + 1}/${attempts} поставити TP/SL невдала: ${error.message}`);
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, 1000));
-    }
-  }
-  return false;
-}
 
+// ----------------------------------------------------------------------------
+// АВАРІЙНЕ ЗАКРИТТЯ ПОЗИЦІЇ
+// ⚠️ Більше НЕ викликається автоматично в основному потоці executeTrade().
+// Раніше TP/SL ставився ОКРЕМИМ запитом ПІСЛЯ відкриття позиції — якщо він
+// падав, позиція лишалась відкритою без захисту, і сюди приходили аварійно
+// закривати. Тепер TP/SL кріпиться АТОМАРНО, одним запитом разом із самим
+// входом (mexc.openMarketOrderWithProtection) — тому проміжного стану
+// "позиція відкрита, TP/SL ще не поставлено" структурно більше не існує:
+// або весь запит проходить (вхід + захист разом), або не проходить
+// жодна частина (позиції взагалі немає, нема чого закривати).
+// Лишаю функцію як утиліту на майбутнє (напр. для ручного аварійного
+// скрипта), просто вона зараз нізвідки не викликається автоматично.
+// ----------------------------------------------------------------------------
 async function emergencyClosePosition({ mexcSymbol, direction, vol, entryPrice }) {
   logger.error(`[TRADE] ⚠️ КРИТИЧНО: TP/SL не встановлено для ${mexcSymbol} після кількох спроб — аварійно закриваю позицію по ринку`);
   try {
@@ -227,14 +223,21 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
     positionType
   });
 
-  const order = await mexc.openMarketOrder({
+  // Вхід і TP/SL — ОДНИМ атомарним запитом (plan.stopLossPrice/plan.takeProfitPrice
+  // вже пораховані riskService.calculatePositionParameters() вище під
+  // orientovnu ціну входу). Проміжного стану "позиція відкрита без
+  // захисту" тут структурно не існує — або проходить все разом, або
+  // нічого не відкривається взагалі.
+  const order = await mexc.openMarketOrderWithProtection({
     symbol: mexcSymbol,
     side,
     vol: plan.contracts,
     leverage: config.risk.leverage,
     openType: config.trading.openType,
     price: entryPriceEstimate,
-    positionMode: config.trading.positionMode
+    positionMode: config.trading.positionMode,
+    stopLossPrice: plan.stopLossPrice,
+    takeProfitPrice: plan.takeProfitPrice
   });
 
   const filled = await waitForFill(order.orderId);
@@ -245,19 +248,6 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
   const actualEntryPrice = parseFloat(filled.dealAvgPrice);
   const actualVol = parseFloat(filled.dealVol);
   const positionId = filled.positionId;
-
-  const exitPrices = riskService.computeExitPrices(actualEntryPrice, direction, contractInfo);
-
-  // Позиція вже РЕАЛЬНО відкрита на біржі до цього моменту. Якщо TP/SL не
-  // вдасться поставити — це небезпечна ситуація (позиція без захисту),
-  // тому пробуємо кілька разів, а якщо все одно не вийшло — аварійно
-  // закриваємо позицію по ринку, замість того щоб лишити її голою.
-  const protectionOk = await attachProtectionWithRetry(positionId, actualVol, exitPrices);
-
-  if (!protectionOk) {
-    await emergencyClosePosition({ mexcSymbol, direction, vol: actualVol, entryPrice: actualEntryPrice });
-    return;
-  }
 
   const openedPosition = {
     symbol,
@@ -270,14 +260,19 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
     leverage: config.risk.leverage,
     requiredMargin: plan.requiredMargin,
     riskAmount: plan.riskAmount,
-    ...exitPrices
+    stopLossPrice: plan.stopLossPrice,
+    takeProfitPrice: plan.takeProfitPrice
   };
 
   positionService.addOpenPosition(openedPosition);
-  await telegram.send(telegram.formatPositionOpened({ ...openedPosition, symbol: mexcSymbol }));
-
   daily.tradesOpened++;
-  logger.info(`[TRADE] ✅ ${mexcSymbol} ${direction} відкрито @ ${actualEntryPrice}, positionId=${positionId}`);
+
+  await telegram.send(telegram.formatPositionOpened({ ...openedPosition, symbol: mexcSymbol })).catch(err => {
+    logger.error(`[TELEGRAM] ${err.message}`);
+  });
+
+  logger.info(`[TRADE] ✅ ${mexcSymbol} ${direction} відкрито @ ${actualEntryPrice} з прикріпленим TP/SL, positionId=${positionId}`);
+  logger.warn(`[TRADE] ⚠️ Перший тест нового атомарного підходу — перевір вручну в MEXC, що TP/SL справді відображаються на позиції.`);
 }
 
 // Полінг статусу ордера доки не заповниться (ринкові ордери заповнюються майже миттєво)
