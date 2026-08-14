@@ -18,10 +18,39 @@ const riskService = require('./services/risk.service');
 
 const { TradeAggregator, SignalEngine, CooldownManager } = require('./core/signal-engine');
 const MultiWebSocketManager = require('./core/websocket-manager');
+const OpenInterestTracker = require('./core/open-interest-tracker');
 
 // Версійна мітка — щоб при діагностиці одразу бачити в логах, яка саме
 // версія коду реально запущена (а не гадати після кожного фіксу).
-const BOT_BUILD = '2026-08-14-atomic-tpsl';
+const BOT_BUILD = '2026-08-15-oi-filter';
+
+const openInterestTracker = new OpenInterestTracker(
+  config.getEnabledSymbols(),
+  config.WINDOW_SECONDS,
+  config.oiFilter.pollIntervalMs
+);
+
+// OI-ФІЛЬТР ПІДТВЕРДЖЕННЯ: див. детальний коментар у core/open-interest-tracker.js.
+// Блокує вхід, якщо OI ще помітно росте (свіжі позиції відкриваються,
+// рух ще не факт що видихся); дозволяє, якщо OI плаский/падає (позиції
+// закриваються — ознака виснаження). Правило симетричне для LONG і SHORT,
+// тому напрямок сигналу тут не потрібен.
+function checkOiConfirmation(symbol) {
+  const cfg = config.oiFilter;
+  if (!cfg.enabled) return { pass: true, reason: 'filter_disabled', changePercent: null };
+
+  const stats = openInterestTracker.getChangeStats(symbol, config.WINDOW_SECONDS * 1000);
+  if (!stats.sufficientData) {
+    return { pass: cfg.passOnInsufficientData, reason: 'insufficient_data', changePercent: null };
+  }
+
+  const pass = stats.changePercent <= cfg.maxIncreasePercent;
+  return {
+    pass,
+    reason: pass ? 'oi_flat_or_falling' : 'oi_still_rising',
+    changePercent: stats.changePercent
+  };
+}
 
 // ----------------------------------------------------------------------------
 // Денна статистика / ліміти
@@ -48,7 +77,7 @@ function resetDailyIfNeeded() {
 // безпосередньо перед виконанням — стан міг змінитись за час очікування
 // початку наступної хвилини)
 // ----------------------------------------------------------------------------
-function validateEntry(symbol, { skipTradingHours = false } = {}) {
+function validateEntry(symbol, { skipTradingHours = false, skipOiFilter = false } = {}) {
   const cfg = config.getSymbolConfig(symbol);
   if (!cfg || !cfg.enabled) return `Символ ${symbol} вимкнено в конфізі`;
 
@@ -65,6 +94,14 @@ function validateEntry(symbol, { skipTradingHours = false } = {}) {
   resetDailyIfNeeded();
   if (daily.tradesOpened >= config.trading.maxDailyTrades) {
     return `Досягнуто денний ліміт угод (${config.trading.maxDailyTrades})`;
+  }
+
+  if (!skipOiFilter) {
+    const oiCheck = checkOiConfirmation(symbol);
+    if (!oiCheck.pass) {
+      const pct = oiCheck.changePercent !== null ? `${oiCheck.changePercent >= 0 ? '+' : ''}${oiCheck.changePercent.toFixed(2)}%` : 'н/д';
+      return `OI-фільтр: ще росте (${pct}, поріг ≤${config.oiFilter.maxIncreasePercent}%) — рух ще має "паливо"`;
+    }
   }
 
   return null; // валідно
@@ -163,7 +200,7 @@ async function emergencyClosePosition({ mexcSymbol, direction, vol, entryPrice }
 // ----------------------------------------------------------------------------
 async function executeTrade(symbol, direction, cfg, options = {}) {
   // Повторна валідація — стан міг змінитись за час очікування
-  const reason = validateEntry(symbol, { skipTradingHours: options.isTest });
+  const reason = validateEntry(symbol, { skipTradingHours: options.isTest, skipOiFilter: options.isTest });
   if (reason) {
     daily.signalsSkipped++;
     logger.warn(`[TRADE] ${symbol} скасовано перед виконанням: ${reason}`);
@@ -172,7 +209,9 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
   }
 
   const mexcSymbol = cfg.mexcSymbol;
-  logger.info(`[TRADE] ${options.isTest ? '[ТЕСТ] ' : ''}Виконую вхід: ${mexcSymbol} ${direction}`);
+  const oiCheckForLog = checkOiConfirmation(symbol);
+  const oiLogStr = oiCheckForLog.changePercent !== null ? `${oiCheckForLog.changePercent >= 0 ? '+' : ''}${oiCheckForLog.changePercent.toFixed(2)}%` : 'н/д';
+  logger.info(`[TRADE] ${options.isTest ? '[ТЕСТ] ' : ''}Виконую вхід: ${mexcSymbol} ${direction} | OI Δ=${oiLogStr}`);
 
   // Баланс і актуальна ціна (в DRY_RUN баланс — умовний, ціна — реальна з публічного API)
   const balance = config.trading.dryRun
@@ -205,9 +244,10 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
       stopLossOrderPrice: plan.stopLossOrderPrice,
       takeProfitPrice: plan.takeProfitPrice,
       takeProfitOrderPrice: plan.takeProfitOrderPrice,
+      oiChangePercent: oiCheckForLog.changePercent,
       positionId: `DRY_RUN_${Date.now()}`
     });
-    await telegram.send(telegram.formatPositionOpened({ ...plan, symbol: mexcSymbol }));
+    await telegram.send(telegram.formatPositionOpened({ ...plan, symbol: mexcSymbol, oiChangePercent: oiCheckForLog.changePercent }));
     daily.tradesOpened++;
     return;
   }
@@ -261,7 +301,8 @@ async function executeTrade(symbol, direction, cfg, options = {}) {
     requiredMargin: plan.requiredMargin,
     riskAmount: plan.riskAmount,
     stopLossPrice: plan.stopLossPrice,
-    takeProfitPrice: plan.takeProfitPrice
+    takeProfitPrice: plan.takeProfitPrice,
+    oiChangePercent: oiCheckForLog.changePercent
   };
 
   positionService.addOpenPosition(openedPosition);
@@ -385,6 +426,7 @@ async function start() {
   console.log(`DRY RUN: ${config.trading.dryRun ? 'УВІМКНЕНО (реальні ордери НЕ відправляються)' : 'вимкнено — ЖИВА ТОРГІВЛЯ'}`);
   console.log(`Моніторинг позицій: ${config.trading.dryRun ? `симуляція по тікеру кожні ${config.monitoring.dryRunIntervalMs / 1000}с` : `WS push (миттєво) + REST-страховка кожні ${config.monitoring.liveFallbackIntervalMs / 1000}с`}`);
   console.log(`Тестова угода при старті: ${config.testTrade.enabled ? `🧪 УВІМКНЕНО (${config.testTrade.symbol} ${config.testTrade.direction}) — вимкни після перевірки!` : 'вимкнено'}`);
+  console.log(`OI-фільтр: ${config.oiFilter.enabled ? `увімкнено (блок якщо OI Δ > +${config.oiFilter.maxIncreasePercent}%)` : 'вимкнено'}`);
   console.log('='.repeat(70));
 
   try {
@@ -418,6 +460,10 @@ async function start() {
   );
   wsManager.connectAll();
 
+  if (config.oiFilter.enabled) {
+    openInterestTracker.start();
+  }
+
   // Якщо не вдалось авторизуватись у приватному WS-стрімі MEXC (наприклад,
   // ключ без прав на futures) — це критично для live-режиму: без нього
   // залишиться лише рідкісна REST-страховка як єдиний спосіб дізнатись про
@@ -449,6 +495,7 @@ async function start() {
   const shutdown = async () => {
     logger.info('[SHUTDOWN] Зупинка...');
     wsManager.closeAll();
+    openInterestTracker.stop();
     positionService.stopMonitoring();
     try {
       await telegram.send(`⛔ Бот зупинено\n\nВідкритих позицій: ${positionService.getOpenPositionsCount()}\nУгод сьогодні: ${daily.tradesOpened}`);
