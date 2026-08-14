@@ -19,6 +19,10 @@ const riskService = require('./services/risk.service');
 const { TradeAggregator, SignalEngine, CooldownManager } = require('./core/signal-engine');
 const MultiWebSocketManager = require('./core/websocket-manager');
 
+// Версійна мітка — щоб при діагностиці одразу бачити в логах, яка саме
+// версія коду реально запущена (а не гадати після кожного фіксу).
+const BOT_BUILD = '2026-08-14-startup-test-trade';
+
 // ----------------------------------------------------------------------------
 // Денна статистика / ліміти
 // ----------------------------------------------------------------------------
@@ -44,11 +48,11 @@ function resetDailyIfNeeded() {
 // безпосередньо перед виконанням — стан міг змінитись за час очікування
 // початку наступної хвилини)
 // ----------------------------------------------------------------------------
-function validateEntry(symbol) {
+function validateEntry(symbol, { skipTradingHours = false } = {}) {
   const cfg = config.getSymbolConfig(symbol);
   if (!cfg || !cfg.enabled) return `Символ ${symbol} вимкнено в конфізі`;
 
-  if (!isWithinTradingHours(config.tradingHours)) {
+  if (!skipTradingHours && !isWithinTradingHours(config.tradingHours)) {
     return `Поза робочими годинами (${config.tradingHours.startHour}:00–${config.tradingHours.endHour}:00 UTC)`;
   }
 
@@ -130,7 +134,18 @@ async function attachProtectionWithRetry(positionId, vol, exitPrices, attempts =
 async function emergencyClosePosition({ mexcSymbol, direction, vol, entryPrice }) {
   logger.error(`[TRADE] ⚠️ КРИТИЧНО: TP/SL не встановлено для ${mexcSymbol} після кількох спроб — аварійно закриваю позицію по ринку`);
   try {
-    await mexc.closePositionMarket({ symbol: mexcSymbol, direction, vol, price: entryPrice });
+    // Беремо СВІЖУ ціну, а не ту, що була на момент входу (могла пройти
+    // хвилина+ через 3 спроби TP/SL) — "price" тут діє як price-protection
+    // межа для маркет-ордера, застаріле значення підвищує шанс відхилення.
+    let closePrice = entryPrice;
+    try {
+      const freshTicker = await mexc.getTicker(mexcSymbol);
+      closePrice = freshTicker.lastPrice;
+    } catch (tickerError) {
+      logger.warn(`[TRADE] Не вдалось отримати свіжу ціну для аварійного закриття, використовую ціну входу: ${tickerError.message}`);
+    }
+
+    await mexc.closePositionMarket({ symbol: mexcSymbol, direction, vol, price: closePrice });
     await telegram.send(
       `🚨 <b>АВАРІЙНЕ ЗАКРИТТЯ ПОЗИЦІЇ</b>\n\n` +
       `<b>${mexcSymbol} ${direction}</b>: не вдалось поставити TP/SL після кількох спроб — ` +
@@ -150,9 +165,9 @@ async function emergencyClosePosition({ mexcSymbol, direction, vol, entryPrice }
 // ----------------------------------------------------------------------------
 // Виконання угоди на MEXC на початку хвилини
 // ----------------------------------------------------------------------------
-async function executeTrade(symbol, direction, cfg) {
+async function executeTrade(symbol, direction, cfg, options = {}) {
   // Повторна валідація — стан міг змінитись за час очікування
-  const reason = validateEntry(symbol);
+  const reason = validateEntry(symbol, { skipTradingHours: options.isTest });
   if (reason) {
     daily.signalsSkipped++;
     logger.warn(`[TRADE] ${symbol} скасовано перед виконанням: ${reason}`);
@@ -161,7 +176,7 @@ async function executeTrade(symbol, direction, cfg) {
   }
 
   const mexcSymbol = cfg.mexcSymbol;
-  logger.info(`[TRADE] Виконую вхід: ${mexcSymbol} ${direction}`);
+  logger.info(`[TRADE] ${options.isTest ? '[ТЕСТ] ' : ''}Виконую вхід: ${mexcSymbol} ${direction}`);
 
   // Баланс і актуальна ціна (в DRY_RUN баланс — умовний, ціна — реальна з публічного API)
   const balance = config.trading.dryRun
@@ -322,6 +337,42 @@ positionService.setOnAllClosedCallback(() => {
 });
 
 // ----------------------------------------------------------------------------
+// ТЕСТОВА УГОДА ПРИ СТАРТІ (опційно, ENABLE_STARTUP_TEST_TRADE=true)
+// Запускає ТОЙ САМИЙ шлях виконання, що й реальний сигнал (ризик-менеджмент,
+// вхід по ринку, спроби TP/SL, аварійне закриття) — щоб відразу побачити,
+// чи все проходить без помилок, не чекаючи природного сигналу.
+// ----------------------------------------------------------------------------
+async function runStartupTestTrade() {
+  const symbol = config.testTrade.symbol;
+  const direction = config.testTrade.direction;
+  const cfg = config.getSymbolConfig(symbol);
+
+  if (!cfg || !cfg.enabled) {
+    logger.error(`[TEST] Символ ${symbol} для тестової угоди не знайдено/вимкнено в конфізі — пропускаю тест`);
+    return;
+  }
+
+  if (config.trading.dryRun) {
+    logger.warn('[TEST] ENABLE_STARTUP_TEST_TRADE=true, але DRY_RUN=true — placeTpSl НЕ буде реально викликано, тест нічого не скаже про роботу TP/SL на біржі.');
+  }
+
+  logger.warn(`[TEST] 🧪 ЗАПУСК ТЕСТОВОЇ УГОДИ: ${symbol} ${direction}`);
+  await telegram.send(
+    `🧪 <b>ТЕСТОВА УГОДА (ENABLE_STARTUP_TEST_TRADE=true)</b>\n\n` +
+    `Відкриваю ${symbol} ${direction}, щоб перевірити вхід/TP/SL/аварійне закриття без очікування реального сигналу.\n\n` +
+    `⚠️ Не забудь вимкнути ENABLE_STARTUP_TEST_TRADE після перевірки — інакше це повторюватиметься на кожному рестарті бота.`
+  );
+
+  try {
+    await executeTrade(symbol, direction, cfg, { isTest: true });
+    logger.info('[TEST] ✅ Тестова угода відпрацювала без фатальних помилок — перевір Telegram/MEXC, чи справді встановлено TP/SL (чи спрацювало аварійне закриття, якщо ні).');
+  } catch (error) {
+    logger.error(`[TEST] ❌ Тестова угода впала з помилкою: ${error.message}`);
+    await telegram.send(`❌ <b>Тестова угода впала з помилкою:</b> ${error.message}`);
+  }
+}
+
+// ----------------------------------------------------------------------------
 // STARTUP
 // ----------------------------------------------------------------------------
 async function start() {
@@ -329,6 +380,7 @@ async function start() {
 
   console.log('='.repeat(70));
   console.log('BINANCE FLOW MONITOR + MEXC FUTURES AUTO-EXECUTION');
+  console.log(`Build: ${BOT_BUILD}`);
   console.log('='.repeat(70));
   console.log(`Символів: ${symbols.length} | Вікно: ${config.WINDOW_SECONDS}с`);
   console.log(`Ризик: ${config.risk.percentOfDeposit}% депозиту | Плече: ${config.risk.leverage}x`);
@@ -337,6 +389,7 @@ async function start() {
   console.log(`Робочі години: ${config.tradingHours.enabled ? `${config.tradingHours.startHour}:00–${config.tradingHours.endHour}:00 UTC` : 'вимкнено (24/7)'}`);
   console.log(`DRY RUN: ${config.trading.dryRun ? 'УВІМКНЕНО (реальні ордери НЕ відправляються)' : 'вимкнено — ЖИВА ТОРГІВЛЯ'}`);
   console.log(`Моніторинг позицій: ${config.trading.dryRun ? `симуляція по тікеру кожні ${config.monitoring.dryRunIntervalMs / 1000}с` : `WS push (миттєво) + REST-страховка кожні ${config.monitoring.liveFallbackIntervalMs / 1000}с`}`);
+  console.log(`Тестова угода при старті: ${config.testTrade.enabled ? `🧪 УВІМКНЕНО (${config.testTrade.symbol} ${config.testTrade.direction}) — вимкни після перевірки!` : 'вимкнено'}`);
   console.log('='.repeat(70));
 
   try {
@@ -349,6 +402,7 @@ async function start() {
   try {
     await telegram.send(
       `🚀 <b>Бот запущено</b>\n\n` +
+      `Build: <code>${BOT_BUILD}</code>\n` +
       `Символів: ${symbols.length}\n` +
       `Ризик: ${config.risk.percentOfDeposit}% / Плече: ${config.risk.leverage}x\n` +
       `TP +${config.risk.takeProfitPercent}% / SL -${config.risk.stopLossPercent}%\n` +
@@ -388,6 +442,14 @@ async function start() {
   positionService.startMonitoring(config.monitoring.dryRunIntervalMs, config.monitoring.liveFallbackIntervalMs);
 
   scheduleDailyStats();
+
+  if (config.testTrade.enabled) {
+    // невелика затримка, щоб WS/MEXC-з'єднання встигли стабілізуватись
+    // перед першим реальним запитом на біржу
+    setTimeout(() => {
+      runStartupTestTrade().catch(err => logger.error(`[TEST] Fatal: ${err.message}`));
+    }, 5000);
+  }
 
   const shutdown = async () => {
     logger.info('[SHUTDOWN] Зупинка...');
