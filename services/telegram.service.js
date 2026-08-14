@@ -37,6 +37,9 @@ class TelegramService {
 
   formatPositionOpened(p) {
     const emoji = p.direction === 'LONG' ? '📈' : '📉';
+    const oiLine = (p.oiChangePercent !== null && p.oiChangePercent !== undefined)
+      ? `\n📊 <b>OI Δ на вході:</b> ${p.oiChangePercent >= 0 ? '+' : ''}${p.oiChangePercent.toFixed(2)}%`
+      : '';
     return `✅ <b>ПОЗИЦІЮ ВІДКРИТО</b>
 
 <b>Символ:</b> ${p.symbol}
@@ -48,7 +51,7 @@ class TelegramService {
 
 🎯 <b>TP:</b> $${p.takeProfitPrice}
 🛑 <b>SL:</b> $${p.stopLossPrice}
-💰 <b>Ризик:</b> $${p.riskAmount.toFixed(2)}`;
+💰 <b>Ризик:</b> $${p.riskAmount.toFixed(2)}${oiLine}`;
   }
 
   formatPositionClosed(p) {
