@@ -153,6 +153,18 @@ const config = {
     // LIVE: основний шлях — WS push (миттєво). Це лише РІДКІСНА страховка
     // REST-запитом на випадок, якщо WS пропустить подію чи довго перепідключається.
     liveFallbackIntervalMs: parseInt(process.env.LIVE_FALLBACK_POLL_MS || '60000')
+  },
+
+  // ТЕСТОВА УГОДА ПРИ СТАРТІ — щоб одразу перевірити вхід/TP/SL/аварійне
+  // закриття, не чекаючи реального сигналу. За замовчуванням ВИМКНЕНО.
+  // ⚠️ Не залишай увімкненим надовго: якщо процес рестартує (напр. crash
+  // loop у контейнері), тестова угода відкриватиметься ЗНОВУ на кожному старті.
+  testTrade: {
+    enabled: process.env.ENABLE_STARTUP_TEST_TRADE === 'true',
+    symbol: (process.env.TEST_TRADE_SYMBOL || 'ADAUSDT').toUpperCase(),
+    direction: ['LONG', 'SHORT'].includes((process.env.TEST_TRADE_DIRECTION || '').toUpperCase())
+      ? process.env.TEST_TRADE_DIRECTION.toUpperCase()
+      : 'LONG'
   }
 };
 
@@ -168,6 +180,9 @@ if (config.trading.maxOpenPositions <= 0) {
 }
 if (config.tradingHours.enabled && (config.tradingHours.startHour < 0 || config.tradingHours.startHour > 23 || config.tradingHours.endHour < 0 || config.tradingHours.endHour > 23)) {
   throw new Error('TRADING_HOURS_START_UTC / TRADING_HOURS_END_UTC must be between 0 and 23');
+}
+if (config.testTrade.enabled && !SYMBOL_CONFIGS[config.testTrade.symbol]) {
+  throw new Error(`TEST_TRADE_SYMBOL=${config.testTrade.symbol} не знайдено серед SYMBOL_CONFIGS`);
 }
 
 module.exports = config;
