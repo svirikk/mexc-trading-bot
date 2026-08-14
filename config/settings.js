@@ -107,6 +107,7 @@ const config = {
   MAX_RECONNECTS: parseInt(process.env.MAX_RECONNECTS) || 10,
 
   BINANCE_WS: 'wss://fstream.binance.com/market', // до 2026-04-23 був /ws — легасі більше не працює для market-стрімів (aggTrade)
+  BINANCE_REST: 'https://fapi.binance.com',
 
   telegram: {
     token: process.env.TELEGRAM_BOT_TOKEN,
@@ -165,6 +166,20 @@ const config = {
     direction: ['LONG', 'SHORT'].includes((process.env.TEST_TRADE_DIRECTION || '').toUpperCase())
       ? process.env.TEST_TRADE_DIRECTION.toUpperCase()
       : 'LONG'
+  },
+
+  // OI-ФІЛЬТР ПІДТВЕРДЖЕННЯ: блокує вхід, якщо Open Interest ще помітно
+  // росте (свіжі позиції відкриваються в напрямку руху -> рух ще не факт
+  // що видихся), дозволяє вхід, якщо OI плаский/падає (позиції
+  // закриваються -> ознака виснаження). Симетрично для LONG і SHORT.
+  oiFilter: {
+    enabled: process.env.ENABLE_OI_FILTER !== 'false',
+    // Максимальний дозволений приріст OI за вікно (%), вище якого вхід блокується
+    maxIncreasePercent: parseFloat(process.env.OI_FILTER_MAX_INCREASE_PERCENT || '0.5'),
+    pollIntervalMs: parseInt(process.env.OI_POLL_INTERVAL_MS || '15000'),
+    // Що робити, якщо даних ще замало (бот щойно стартував):
+    // true = пропустити вхід (не блокувати), false = заблокувати про всяк випадок
+    passOnInsufficientData: process.env.OI_FILTER_PASS_ON_INSUFFICIENT_DATA === 'true'
   }
 };
 
