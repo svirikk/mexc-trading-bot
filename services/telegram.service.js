@@ -59,13 +59,14 @@ class TelegramService {
     const emoji = isProfit ? '🟢' : '🔴';
     const hitLabel = p.hitType ? ` (${p.hitType})` : '';
     const simulatedNote = p.simulated ? '\n\n🧪 <i>Симуляція DRY RUN — без реальних комісій/сліпеджу</i>' : '';
+    const reasonLine = p.closeReason ? `\n<b>Причина:</b> ${p.closeReason}` : '';
     return `${emoji} <b>ПОЗИЦІЮ ЗАКРИТО${hitLabel} — ${isProfit ? 'ПРИБУТОК' : 'ЗБИТОК'}</b>
 
 <b>Символ:</b> ${p.symbol}
 <b>Напрямок:</b> ${p.direction}
 <b>Вхід:</b> $${p.entryPrice}  →  <b>Вихід:</b> $${p.exitPrice ?? '—'}
 <b>Результат:</b> ${p.pnl >= 0 ? '+' : ''}$${p.pnl.toFixed(2)}
-<b>Тривалість:</b> ${p.duration || '—'}${simulatedNote}`;
+<b>Тривалість:</b> ${p.duration || '—'}${reasonLine}${simulatedNote}`;
   }
 
   formatDailyStats(stats) {

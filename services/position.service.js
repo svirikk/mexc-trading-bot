@@ -12,6 +12,7 @@ class PositionService {
     this.monitorInterval = null;
     this.lastResetDate = getCurrentDate();
     this.onAllClosedCallback = null;
+    this.onPositionClosedCallback = null;
   }
 
   hasOpenPosition(symbol) {
@@ -22,11 +23,23 @@ class PositionService {
     return this.openPositions.size;
   }
 
+  getAllOpenPositions() {
+    return Array.from(this.openPositions.entries()); // [[symbol, tracked], ...]
+  }
+
   // Викликається щоразу, коли кількість відкритих позицій доходить до 0
   // (використовується для відкладеної денної статистики — почекати,
   // поки всі позиції закриються, і тільки тоді надіслати підсумок).
   setOnAllClosedCallback(fn) {
     this.onAllClosedCallback = fn;
+  }
+
+  // Викликається на КОЖНЕ закриття позиції (незалежно від джерела —
+  // WS push / REST-страховка / DRY_RUN симуляція / примусове закриття),
+  // з повним closedData (включно з pnl). Використовується, наприклад,
+  // для лічильника серії збиткових угод поспіль (circuit breaker).
+  setOnPositionClosedCallback(fn) {
+    this.onPositionClosedCallback = fn;
   }
 
   addOpenPosition(data) {
@@ -206,11 +219,54 @@ class PositionService {
   }
 
   // ---------------------------------------------------------------------
-  // Спільна фіналізація закриття незалежно від джерела (WS push /
-  // REST-страховка / DRY_RUN симуляція) — один шлях запису статистики й
-  // сповіщення, щоб не дублювати логіку в трьох місцях.
+  // ПРИМУСОВЕ ЗАКРИТТЯ (circuit breaker: BTC crash і т.д.) — на відміну від
+  // TP/SL, тут ми самі ІНІЦІЮЄМО закриття по поточній ринковій ціні,
+  // незалежно від того, чи досягнуті рівні TP/SL. Працює в обох режимах:
+  // у DRY_RUN просто симулює (як checkDryRunPosition), у LIVE реально
+  // закриває позицію на біржі маркет-ордером.
   // ---------------------------------------------------------------------
-  async finalizeClosedPosition(symbol, tracked, { exitPrice, pnl, hitType = null, simulated = false }) {
+  async forceClosePosition(symbol, reason) {
+    const tracked = this.openPositions.get(symbol);
+    if (!tracked) return false;
+
+    try {
+      const ticker = await mexc.getTicker(tracked.mexcSymbol);
+      const exitPrice = ticker.lastPrice;
+      const contractSize = tracked.contractSize || 1;
+      const priceDiff = tracked.direction === 'LONG'
+        ? (exitPrice - tracked.entryPrice)
+        : (tracked.entryPrice - exitPrice);
+      const pnl = priceDiff * tracked.contracts * contractSize;
+
+      if (!config.trading.dryRun) {
+        await mexc.closePositionMarket({
+          symbol: tracked.mexcSymbol,
+          direction: tracked.direction,
+          vol: tracked.contracts,
+          price: exitPrice
+        });
+      }
+
+      await this.finalizeClosedPosition(symbol, tracked, {
+        exitPrice,
+        pnl,
+        hitType: 'FORCED',
+        simulated: config.trading.dryRun,
+        closeReason: reason
+      });
+      return true;
+    } catch (error) {
+      logger.error(`[POSITION] Не вдалось примусово закрити ${symbol}: ${error.message}`);
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Спільна фіналізація закриття незалежно від джерела (WS push /
+  // REST-страховка / DRY_RUN симуляція / примусове закриття) — один шлях
+  // запису статистики й сповіщення, щоб не дублювати логіку в кількох місцях.
+  // ---------------------------------------------------------------------
+  async finalizeClosedPosition(symbol, tracked, { exitPrice, pnl, hitType = null, simulated = false, closeReason = null }) {
     const durationSec = Math.floor((Date.now() - tracked.openedAt) / 1000);
 
     const closedData = {
@@ -219,6 +275,7 @@ class PositionService {
       pnl: pnl ?? 0,
       hitType,
       simulated,
+      closeReason,
       duration: formatDuration(durationSec)
     };
 
@@ -226,7 +283,13 @@ class PositionService {
     this.removeOpenPosition(symbol);
 
     await telegram.send(telegram.formatPositionClosed(closedData));
-    logger.info(`[POSITION] Закрито: ${symbol} | PnL: ${closedData.pnl} | ${closedData.duration}${simulated ? ' [DRY RUN]' : ''}`);
+    logger.info(`[POSITION] Закрито: ${symbol} | PnL: ${closedData.pnl} | ${closedData.duration}${simulated ? ' [DRY RUN]' : ''}${closeReason ? ` | Причина: ${closeReason}` : ''}`);
+
+    if (this.onPositionClosedCallback) {
+      try { this.onPositionClosedCallback(closedData); } catch (err) {
+        logger.error(`[POSITION] onPositionClosedCallback error: ${err.message}`);
+      }
+    }
   }
 
   maybeResetDaily() {
