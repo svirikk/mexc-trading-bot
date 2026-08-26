@@ -180,8 +180,40 @@ const config = {
     // Що робити, якщо даних ще замало (бот щойно стартував):
     // true = пропустити вхід (не блокувати), false = заблокувати про всяк випадок
     passOnInsufficientData: process.env.OI_FILTER_PASS_ON_INSUFFICIENT_DATA === 'true'
+  },
+
+  // BTC CIRCUIT BREAKER: якщо BTC різко впав (чи зріс) і Open Interest по
+  // ньому одночасно росте (свіжі позиції відкриваються -> рух ще має
+  // "паливо", схоже на каскад/маніпуляцію) — зупиняємо ВСІ нові входи по
+  // ВСІХ символах на певний час, і примусово закриваємо позиції, відкриті
+  // зовсім недавно (щоб не "пролитися" разом з ринком).
+  btcCircuitBreaker: {
+    enabled: process.env.ENABLE_BTC_CIRCUIT_BREAKER !== 'false',
+    monitorSymbol: 'BTCUSDT',
+    // Поріг "жорсткого руху" BTC за вікно WINDOW_SECONDS, у % (додатне число)
+    minMovePercent: parseFloat(process.env.BTC_CRASH_MIN_MOVE_PERCENT || '1.0'),
+    // Мінімальний приріст OI по BTC за те саме вікно, що підтверджує
+    // "рух ще має паливо" (не просто закриття позицій)
+    minOiIncreasePercent: parseFloat(process.env.BTC_CRASH_MIN_OI_INCREASE_PERCENT || '0.5'),
+    haltDurationMs: parseFloat(process.env.BTC_CRASH_HALT_HOURS || '1') * 60 * 60 * 1000,
+    // Позиції, відкриті менше ніж стільки хвилин тому на момент спрацювання,
+    // будуть примусово закриті по ринку
+    forceCloseMaxAgeMinutes: parseFloat(process.env.BTC_CRASH_FORCE_CLOSE_MAX_AGE_MINUTES || '3'),
+    checkIntervalMs: parseInt(process.env.BTC_CRASH_CHECK_INTERVAL_MS || '5000')
+  },
+
+  // LOSS STREAK CIRCUIT BREAKER: N збиткових угод поспіль (по всіх символах
+  // разом, без урахування напрямку) -> зупинка торгів. Лічильник скидається
+  // на 0 при будь-якій прибутковій угоді. Друге спрацювання за той самий
+  // календарний день -> зупинка до початку наступного робочого вікна.
+  lossStreakCircuitBreaker: {
+    enabled: process.env.ENABLE_LOSS_STREAK_CIRCUIT_BREAKER !== 'false',
+    maxConsecutiveLosses: parseInt(process.env.LOSS_STREAK_MAX_CONSECUTIVE || '3'),
+    firstHaltHours: parseFloat(process.env.LOSS_STREAK_FIRST_HALT_HOURS || '2'),
+    maxOccurrencesPerDay: parseInt(process.env.LOSS_STREAK_MAX_PER_DAY || '2')
   }
 };
+
 
 // ---- validation ----
 if (config.risk.percentOfDeposit <= 0 || config.risk.percentOfDeposit > 100) {
