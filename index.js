@@ -22,10 +22,21 @@ const OpenInterestTracker = require('./core/open-interest-tracker');
 
 // Версійна мітка — щоб при діагностиці одразу бачити в логах, яка саме
 // версія коду реально запущена (а не гадати після кожного фіксу).
-const BOT_BUILD = '2026-08-15-oi-filter';
+const BOT_BUILD = '2026-08-16-circuit-breakers';
+
+// tradeAggregator створюється в start(), але потрібен і для моніторингу BTC
+// (checkBtcCrashCircuitBreaker) — тому оголошений на рівні модуля.
+let tradeAggregator = null;
+
+// OI-трекер стежить і за торговими символами (для per-symbol фільтра), і за
+// BTCUSDT (для ринкового circuit breaker), якщо він увімкнений.
+const oiTrackedSymbols = [...config.getEnabledSymbols()];
+if (config.btcCircuitBreaker.enabled && !oiTrackedSymbols.includes(config.btcCircuitBreaker.monitorSymbol)) {
+  oiTrackedSymbols.push(config.btcCircuitBreaker.monitorSymbol);
+}
 
 const openInterestTracker = new OpenInterestTracker(
-  config.getEnabledSymbols(),
+  oiTrackedSymbols,
   config.WINDOW_SECONDS,
   config.oiFilter.pollIntervalMs
 );
@@ -51,6 +62,137 @@ function checkOiConfirmation(symbol) {
     changePercent: stats.changePercent
   };
 }
+
+// ----------------------------------------------------------------------------
+// CIRCUIT BREAKERS
+// 1) BTC crash+OI: якщо BTC різко рухається і OI по ньому одночасно росте
+//    (свіжі позиції відкриваються -> рух ще має "паливо", схоже на
+//    каскад/маніпуляцію) -> стоп усіх нових входів по ВСІХ символах на
+//    певний час + примусове закриття щойно (< N хв тому) відкритих позицій.
+// 2) Серія збиткових угод поспіль (по всіх символах) -> ескалаційна
+//    зупинка: перший раз за день — на кілька годин, другий раз за той
+//    самий день — до початку наступного робочого вікна.
+// В ОБОХ випадках сигнали й далі детектуються і показуються в Telegram як
+// "проігноровані" (validateEntry повертає причину, яка йде через звичайний
+// шлях formatSignalSkipped) — це навмисно, щоб потім можна було вручну
+// оцінити, чи спрацювання було доречним.
+// Circuit breaker НЕ обходиться навіть тестовою угодою (isTest) — це
+// запобіжник реальної небезпеки, а не питання зручності тестування.
+// ----------------------------------------------------------------------------
+const circuitBreaker = {
+  haltedUntil: null,
+  haltReason: null,
+  consecutiveLosses: 0,
+  lossBreakerCountToday: 0,
+  lossBreakerDate: getCurrentDate()
+};
+
+function isTradingHalted() {
+  if (!circuitBreaker.haltedUntil) return false;
+  if (Date.now() >= circuitBreaker.haltedUntil) {
+    logger.info(`[CIRCUIT BREAKER] Halt завершено (був: ${circuitBreaker.haltReason})`);
+    circuitBreaker.haltedUntil = null;
+    circuitBreaker.haltReason = null;
+    return false;
+  }
+  return true;
+}
+
+function getHaltStatusText() {
+  if (!circuitBreaker.haltedUntil) return null;
+  const untilStr = new Date(circuitBreaker.haltedUntil).toISOString().substring(11, 19);
+  return `${circuitBreaker.haltReason} (до ${untilStr} UTC)`;
+}
+
+function triggerHalt(durationMs, reason) {
+  circuitBreaker.haltedUntil = Date.now() + durationMs;
+  circuitBreaker.haltReason = reason;
+  const untilStr = new Date(circuitBreaker.haltedUntil).toISOString().substring(11, 19);
+  logger.error(`[CIRCUIT BREAKER] 🛑 ТОРГІВЛЮ ЗУПИНЕНО до ${untilStr} UTC: ${reason}`);
+  telegram.send(
+    `🛑 <b>ТОРГІВЛЮ ТИМЧАСОВО ЗУПИНЕНО</b>\n\n` +
+    `<b>Причина:</b> ${reason}\n` +
+    `<b>До:</b> ${untilStr} UTC\n\n` +
+    `Сигнали й далі детектуватимуться і показуватимуться як проігноровані (для подальшого аналізу) — просто без відкриття угод.`
+  ).catch(() => {});
+}
+
+// ---- 1) BTC CRASH + OI ----
+async function forceCloseRecentPositions(maxAgeMinutes, reason) {
+  const maxAgeMs = maxAgeMinutes * 60 * 1000;
+  const now = Date.now();
+  for (const [symbol, tracked] of positionService.getAllOpenPositions()) {
+    if (now - tracked.openedAt <= maxAgeMs) {
+      logger.warn(`[CIRCUIT BREAKER] Примусово закриваю ${symbol} (відкрито ${Math.round((now - tracked.openedAt) / 1000)}с тому)`);
+      await positionService.forceClosePosition(symbol, reason);
+    }
+  }
+}
+
+function checkBtcCrashCircuitBreaker() {
+  const cfg = config.btcCircuitBreaker;
+  if (!cfg.enabled) return;
+  if (isTradingHalted()) return; // вже зупинено, нема сенсу перевіряти знову
+  if (!tradeAggregator) return;
+
+  const stats = tradeAggregator.getStats(cfg.monitorSymbol);
+  if (!stats) return; // ще нема даних по BTC
+
+  if (Math.abs(stats.priceChange) < cfg.minMovePercent) return; // рух ще не жорсткий
+
+  const oiStats = openInterestTracker.getChangeStats(cfg.monitorSymbol, config.WINDOW_SECONDS * 1000);
+  if (!oiStats.sufficientData) return;
+
+  // Той самий напрямок-незалежний критерій, що й у per-symbol OI-фільтрі:
+  // ціна різко рухається (в будь-який бік) + OI одночасно росте -> нові
+  // позиції відкриваються в напрямку руху -> рух ще має "паливо".
+  if (oiStats.changePercent < cfg.minOiIncreasePercent) return;
+
+  const reason = `BTC ${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% за ${Math.round(stats.duration)}с, ` +
+    `OI ${oiStats.changePercent >= 0 ? '+' : ''}${oiStats.changePercent.toFixed(2)}% — ймовірний каскад/маніпуляція`;
+
+  triggerHalt(cfg.haltDurationMs, reason);
+  forceCloseRecentPositions(cfg.forceCloseMaxAgeMinutes, `BTC circuit breaker: ${reason}`)
+    .catch(err => logger.error(`[CIRCUIT BREAKER] Помилка примусового закриття: ${err.message}`));
+}
+
+// ---- 2) СЕРІЯ ЗБИТКОВИХ УГОД ПОСПІЛЬ ----
+function resetLossBreakerDateIfNeeded() {
+  const today = getCurrentDate();
+  if (today !== circuitBreaker.lossBreakerDate) {
+    circuitBreaker.lossBreakerDate = today;
+    circuitBreaker.lossBreakerCountToday = 0;
+  }
+}
+
+positionService.setOnPositionClosedCallback((closedData) => {
+  const cfg = config.lossStreakCircuitBreaker;
+  if (!cfg.enabled) return;
+
+  resetLossBreakerDateIfNeeded();
+
+  if (closedData.pnl < 0) {
+    circuitBreaker.consecutiveLosses++;
+    logger.warn(`[CIRCUIT BREAKER] Збиткова угода поспіль: ${circuitBreaker.consecutiveLosses}/${cfg.maxConsecutiveLosses}`);
+
+    if (circuitBreaker.consecutiveLosses >= cfg.maxConsecutiveLosses) {
+      circuitBreaker.lossBreakerCountToday++;
+      circuitBreaker.consecutiveLosses = 0; // рахуємо серію заново після halt
+
+      if (circuitBreaker.lossBreakerCountToday >= cfg.maxOccurrencesPerDay) {
+        const untilTomorrow = msUntilNextUtcTime(config.tradingHours.startHour, 0);
+        triggerHalt(untilTomorrow, `Друга серія з ${cfg.maxConsecutiveLosses} стоп-лоссів поспіль за сьогодні — торгівля зупинена до завтра`);
+      } else {
+        triggerHalt(cfg.firstHaltHours * 60 * 60 * 1000, `${cfg.maxConsecutiveLosses} стоп-лосси поспіль`);
+      }
+    }
+  } else {
+    if (circuitBreaker.consecutiveLosses > 0) {
+      logger.info(`[CIRCUIT BREAKER] Прибуткова угода — лічильник збиткової серії скинуто (був ${circuitBreaker.consecutiveLosses})`);
+    }
+    circuitBreaker.consecutiveLosses = 0;
+  }
+});
 
 // ----------------------------------------------------------------------------
 // Денна статистика / ліміти
@@ -80,6 +222,12 @@ function resetDailyIfNeeded() {
 function validateEntry(symbol, { skipTradingHours = false, skipOiFilter = false } = {}) {
   const cfg = config.getSymbolConfig(symbol);
   if (!cfg || !cfg.enabled) return `Символ ${symbol} вимкнено в конфізі`;
+
+  // Circuit breaker — НЕ обходиться навіть тестовою угодою (isTest), це
+  // запобіжник реальної небезпеки, а не питання зручності тестування.
+  if (isTradingHalted()) {
+    return `Circuit breaker: ${getHaltStatusText()}`;
+  }
 
   if (!skipTradingHours && !isWithinTradingHours(config.tradingHours)) {
     return `Поза робочими годинами (${config.tradingHours.startHour}:00–${config.tradingHours.endHour}:00 UTC)`;
@@ -427,6 +575,8 @@ async function start() {
   console.log(`Моніторинг позицій: ${config.trading.dryRun ? `симуляція по тікеру кожні ${config.monitoring.dryRunIntervalMs / 1000}с` : `WS push (миттєво) + REST-страховка кожні ${config.monitoring.liveFallbackIntervalMs / 1000}с`}`);
   console.log(`Тестова угода при старті: ${config.testTrade.enabled ? `🧪 УВІМКНЕНО (${config.testTrade.symbol} ${config.testTrade.direction}) — вимкни після перевірки!` : 'вимкнено'}`);
   console.log(`OI-фільтр: ${config.oiFilter.enabled ? `увімкнено (блок якщо OI Δ > +${config.oiFilter.maxIncreasePercent}%)` : 'вимкнено'}`);
+  console.log(`BTC circuit breaker: ${config.btcCircuitBreaker.enabled ? `увімкнено (|ΔBTC|≥${config.btcCircuitBreaker.minMovePercent}% + OI≥+${config.btcCircuitBreaker.minOiIncreasePercent}% -> стоп ${config.btcCircuitBreaker.haltDurationMs/3600000}год)` : 'вимкнено'}`);
+  console.log(`Loss streak circuit breaker: ${config.lossStreakCircuitBreaker.enabled ? `увімкнено (${config.lossStreakCircuitBreaker.maxConsecutiveLosses} SL поспіль -> стоп ${config.lossStreakCircuitBreaker.firstHaltHours}год, 2-й раз/день -> до завтра)` : 'вимкнено'}`);
   console.log('='.repeat(70));
 
   try {
@@ -450,18 +600,34 @@ async function start() {
     logger.error(`[TELEGRAM] ${error.message}`);
   }
 
-  const tradeAggregator = new TradeAggregator(config.WINDOW_SECONDS);
+  tradeAggregator = new TradeAggregator(config.WINDOW_SECONDS);
   const signalEngine = new SignalEngine();
   const cooldownManager = new CooldownManager();
 
+  // BTC додається до WS-підписки лише для моніторингу (немає в SYMBOL_CONFIGS,
+  // тому shouldAlert/interpretSignal завжди повертають false для нього —
+  // BTC ніколи не торгується сам, тільки впливає на circuit breaker).
+  const wsSymbols = config.btcCircuitBreaker.enabled && !symbols.includes(config.btcCircuitBreaker.monitorSymbol)
+    ? [...symbols, config.btcCircuitBreaker.monitorSymbol]
+    : symbols;
+
   const wsManager = new MultiWebSocketManager(
-    symbols, tradeAggregator, signalEngine, cooldownManager, handleSignal,
+    wsSymbols, tradeAggregator, signalEngine, cooldownManager, handleSignal,
     () => isWithinTradingHours(config.tradingHours)
   );
   wsManager.connectAll();
 
-  if (config.oiFilter.enabled) {
+  if (config.oiFilter.enabled || config.btcCircuitBreaker.enabled) {
     openInterestTracker.start();
+  }
+
+  let btcCheckInterval = null;
+  if (config.btcCircuitBreaker.enabled) {
+    btcCheckInterval = setInterval(() => {
+      try { checkBtcCrashCircuitBreaker(); } catch (err) {
+        logger.error(`[CIRCUIT BREAKER] BTC check error: ${err.message}`);
+      }
+    }, config.btcCircuitBreaker.checkIntervalMs);
   }
 
   // Якщо не вдалось авторизуватись у приватному WS-стрімі MEXC (наприклад,
@@ -496,6 +662,7 @@ async function start() {
     logger.info('[SHUTDOWN] Зупинка...');
     wsManager.closeAll();
     openInterestTracker.stop();
+    if (btcCheckInterval) clearInterval(btcCheckInterval);
     positionService.stopMonitoring();
     try {
       await telegram.send(`⛔ Бот зупинено\n\nВідкритих позицій: ${positionService.getOpenPositionsCount()}\nУгод сьогодні: ${daily.tradesOpened}`);
@@ -514,4 +681,15 @@ if (require.main === module) {
   });
 }
 
-module.exports = { start, handleSignal, executeTrade };
+module.exports = {
+  start, handleSignal, executeTrade,
+  // Внутрішні речі, виставлені лише для тестування — не впливають на
+  // публічний API/поведінку продакшена.
+  _internal: {
+    validateEntry,
+    isTradingHalted,
+    checkBtcCrashCircuitBreaker,
+    circuitBreaker,
+    setTradeAggregatorForTest: (ta) => { tradeAggregator = ta; }
+  }
+};
