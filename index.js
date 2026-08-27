@@ -22,7 +22,7 @@ const OpenInterestTracker = require('./core/open-interest-tracker');
 
 // Версійна мітка — щоб при діагностиці одразу бачити в логах, яка саме
 // версія коду реально запущена (а не гадати після кожного фіксу).
-const BOT_BUILD = '2026-08-16-circuit-breakers';
+const BOT_BUILD = '2026-08-27-remove-pepe-bonk-btc-debug-log';
 
 // tradeAggregator створюється в start(), але потрібен і для моніторингу BTC
 // (checkBtcCrashCircuitBreaker) — тому оголошений на рівні модуля.
@@ -129,6 +129,8 @@ async function forceCloseRecentPositions(maxAgeMinutes, reason) {
   }
 }
 
+let lastBtcDebugLog = 0;
+
 function checkBtcCrashCircuitBreaker() {
   const cfg = config.btcCircuitBreaker;
   if (!cfg.enabled) return;
@@ -136,11 +138,34 @@ function checkBtcCrashCircuitBreaker() {
   if (!tradeAggregator) return;
 
   const stats = tradeAggregator.getStats(cfg.monitorSymbol);
-  if (!stats) return; // ще нема даних по BTC
+  const now = Date.now();
+
+  if (!stats) {
+    if (now - lastBtcDebugLog > 30000) {
+      logger.warn(`[CIRCUIT BREAKER][BTC] Ще немає даних по ${cfg.monitorSymbol} — WS ще не накопичив трейди в межах вікна`);
+      lastBtcDebugLog = now;
+    }
+    return; // ще нема даних по BTC
+  }
+
+  const oiStats = openInterestTracker.getChangeStats(cfg.monitorSymbol, config.WINDOW_SECONDS * 1000);
+
+  // Періодичний діагностичний лог (раз на ~30с, не на кожен виклик) — щоб
+  // бачити РЕАЛЬНІ значення ціни/OI по BTC і свідомо підбирати пороги,
+  // а не гадати наосліп, чому щось (не) спрацювало.
+  if (now - lastBtcDebugLog > 30000) {
+    const oiStr = oiStats.sufficientData
+      ? `${oiStats.changePercent >= 0 ? '+' : ''}${oiStats.changePercent.toFixed(2)}%`
+      : 'н/д (замало даних)';
+    logger.info(
+      `[CIRCUIT BREAKER][BTC] Δціни=${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(2)}% ` +
+      `(поріг ±${cfg.minMovePercent}%) | OI Δ=${oiStr} (поріг ≥+${cfg.minOiIncreasePercent}%) за ${Math.round(stats.duration)}с`
+    );
+    lastBtcDebugLog = now;
+  }
 
   if (Math.abs(stats.priceChange) < cfg.minMovePercent) return; // рух ще не жорсткий
 
-  const oiStats = openInterestTracker.getChangeStats(cfg.monitorSymbol, config.WINDOW_SECONDS * 1000);
   if (!oiStats.sufficientData) return;
 
   // Той самий напрямок-незалежний критерій, що й у per-symbol OI-фільтрі:
