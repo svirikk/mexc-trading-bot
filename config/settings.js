@@ -31,25 +31,9 @@ const SYMBOL_CONFIGS = {
     cooldownMinutes: 5,
     enabled: true
   },
-  PEPEUSDT: {
-    mexcSymbol: 'PEPE_USDT',
-    minVolumeUSD: 1_000_000,
-    minDominance: 65.0,
-    minPriceChange: 0.6,
-    cooldownMinutes: 5,
-    enabled: true
-  },
   WIFUSDT: {
     mexcSymbol: 'WIF_USDT',
     minVolumeUSD: 1_500_000,
-    minDominance: 65.0,
-    minPriceChange: 0.5,
-    cooldownMinutes: 5,
-    enabled: true
-  },
-  BONKUSDT: {
-    mexcSymbol: 'BONK_USDT',
-    minVolumeUSD: 1_000_000,
     minDominance: 65.0,
     minPriceChange: 0.5,
     cooldownMinutes: 5,
