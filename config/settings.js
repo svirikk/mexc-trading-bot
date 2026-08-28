@@ -61,7 +61,7 @@ const SYMBOL_CONFIGS = {
     minDominance: 65.0,
     minPriceChange: 0.5,
     cooldownMinutes: 5,
-    enabled: true
+    enabled: false
   }
 };
 
